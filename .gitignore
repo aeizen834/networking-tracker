@@ -29,3 +29,6 @@ src/data/swapped.json
 
 # claude.ai artifact build
 dist-artifact
+
+# Private backups with real contact data
+private/

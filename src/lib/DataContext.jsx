@@ -1,17 +1,20 @@
 // App-wide data store using React Context.
 //
-// Two storage backends, same API for the rest of the app:
-//  - "db": when published as a claude.ai Artifact, data lives in the artifact's
-//    database (collections: people, interactions, snoozes) and syncs across devices.
-//  - "local": when running on your computer (npm run dev), data lives in this
-//    browser's localStorage and the first load is seeded from src/data/seed.json.
+// Three storage backends, same API for the rest of the app:
+//  - "supabase": the GitHub Pages site (and local dev when .env has Supabase settings).
+//    You sign in with an email link; data lives in your Supabase database and syncs
+//    across devices. Row Level Security means only you can read or change it.
+//  - "db": when published as a claude.ai Artifact, data lives in the artifact's database.
+//  - "local": fallback when neither is available; data lives in this browser's localStorage.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { buildProfiles, buildSuggestions } from './insights.js';
 import { todayISO } from './dates.js';
+import { supabase } from './supabase.js';
 
 const LOCAL_KEY = 'networking-tracker:collections:v2';
 const COLLECTIONS = ['people', 'interactions', 'snoozes'];
 const EMPTY = { people: {}, interactions: {}, snoozes: {} };
+const TABLE = 'records';
 
 const DataContext = createContext(null);
 
@@ -53,7 +56,7 @@ async function loadSeed() {
   return toCollections(seed);
 }
 
-/** Retry a db call on transient / rate-limit errors. */
+/** Retry a claude.ai db call on transient / rate-limit errors. */
 async function withRetry(fn, tries = 5) {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -66,12 +69,31 @@ async function withRetry(fn, tries = 5) {
   }
 }
 
+/** Read every row the signed-in user owns (Supabase returns at most 1000 per request). */
+async function fetchAllRecords() {
+  const cols = { people: {}, interactions: {}, snoozes: {} };
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('collection,id,data')
+      .order('collection')
+      .order('id')
+      .range(from, from + 999);
+    if (error) throw error;
+    for (const r of data) if (cols[r.collection]) cols[r.collection][r.id] = r.data;
+    if (data.length < 1000) break;
+  }
+  return cols;
+}
+
 export function DataProvider({ children }) {
   const [cols, setCols] = useState(EMPTY);
-  const [backend, setBackend] = useState(null); // 'db' | 'local'
-  const [status, setStatus] = useState('loading'); // loading | slow | ready | error
+  const [backend, setBackend] = useState(null); // 'supabase' | 'db' | 'local'
+  const [status, setStatus] = useState('loading'); // loading | slow | signedOut | ready | error
   const [writeError, setWriteError] = useState(null);
-  const dbRef = useRef(null);
+  const [userEmail, setUserEmail] = useState(null);
+  const dbRef = useRef(null); // claude.ai artifact db
+  const userIdRef = useRef(null); // Supabase user id
   const colsRef = useRef(cols); // latest data, for actions that read before writing
   useEffect(() => {
     colsRef.current = cols;
@@ -80,9 +102,51 @@ export function DataProvider({ children }) {
   // ---------- connect to storage (runs once) ----------
   useEffect(() => {
     let cancelled = false;
-    const unsubs = [];
+    const cleanups = [];
     let timer;
 
+    // --- Supabase (GitHub Pages / local dev) ---
+    if (supabase) {
+      setBackend('supabase');
+      const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+        // Don't call Supabase from inside this callback; defer to the next tick.
+        setTimeout(async () => {
+          if (cancelled) return;
+          if (!session) {
+            userIdRef.current = null;
+            setUserEmail(null);
+            setCols(EMPTY);
+            setStatus('signedOut');
+            return;
+          }
+          // Remove the one-time ?code=... from the address bar after an email-link sign-in
+          if (window.location.search.includes('code=')) {
+            window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+          }
+          if (userIdRef.current === session.user.id) return; // token refresh, same user
+          userIdRef.current = session.user.id;
+          setUserEmail(session.user.email);
+          setStatus('loading');
+          try {
+            const loaded = await fetchAllRecords();
+            if (!cancelled) {
+              setCols(loaded);
+              setStatus('ready');
+            }
+          } catch (e) {
+            setStatus('error');
+            setWriteError(`Couldn’t load your data: ${e.message}`);
+          }
+        }, 0);
+      });
+      cleanups.push(() => data.subscription.unsubscribe());
+      return () => {
+        cancelled = true;
+        cleanups.forEach((c) => c());
+      };
+    }
+
+    // --- claude.ai artifact database, or this browser ---
     (async () => {
       const db = window.claude?.use ? await window.claude.use('db').catch(() => null) : null;
       if (cancelled) return;
@@ -101,7 +165,7 @@ export function DataProvider({ children }) {
       timer = setTimeout(() => setStatus((s) => (s === 'loading' ? 'slow' : s)), 10000);
       const seen = new Set();
       for (const name of COLLECTIONS) {
-        unsubs.push(
+        cleanups.push(
           db.collection(name).onSnapshot(
             (snap) => {
               const map = {};
@@ -126,7 +190,7 @@ export function DataProvider({ children }) {
     return () => {
       cancelled = true;
       clearTimeout(timer);
-      unsubs.forEach((u) => u());
+      cleanups.forEach((c) => c());
     };
   }, []);
 
@@ -139,7 +203,7 @@ export function DataProvider({ children }) {
   const report = useCallback((e) => {
     const msg = e?.code === 'quota_exceeded'
       ? 'Storage is full. Delete some old interactions to make room.'
-      : `Couldn’t save that change (${e?.code || 'error'}). Try again.`;
+      : `Couldn’t save that change (${e?.message || e?.code || 'error'}). Reload and try again.`;
     setWriteError(msg);
   }, []);
 
@@ -151,8 +215,19 @@ export function DataProvider({ children }) {
         report(e);
         throw e;
       }
-    } else {
-      setCols((c) => ({ ...c, [coll]: { ...c[coll], [id]: body } }));
+      return;
+    }
+    // Local and Supabase: update the screen right away, then save.
+    setCols((c) => ({ ...c, [coll]: { ...c[coll], [id]: body } }));
+    if (supabase && userIdRef.current) {
+      const { error } = await supabase.from(TABLE).upsert(
+        { user_id: userIdRef.current, collection: coll, id, data: body, updated_at: new Date().toISOString() },
+        { onConflict: 'user_id,collection,id' }
+      );
+      if (error) {
+        report(error);
+        throw error;
+      }
     }
   }, [report]);
 
@@ -164,11 +239,18 @@ export function DataProvider({ children }) {
         report(e);
         throw e;
       }
-    } else {
-      setCols((c) => {
-        const { [id]: _drop, ...rest } = c[coll];
-        return { ...c, [coll]: rest };
-      });
+      return;
+    }
+    setCols((c) => {
+      const { [id]: _drop, ...rest } = c[coll];
+      return { ...c, [coll]: rest };
+    });
+    if (supabase && userIdRef.current) {
+      const { error } = await supabase.from(TABLE).delete().eq('collection', coll).eq('id', id);
+      if (error) {
+        report(error);
+        throw error;
+      }
     }
   }, [report]);
 
@@ -213,6 +295,30 @@ export function DataProvider({ children }) {
     /** Replace everything (spreadsheet import / backup restore). Reports progress 0..1. */
     async replaceAll(next, onProgress = () => {}) {
       const target = toCollections(next);
+
+      if (supabase && userIdRef.current) {
+        const uid = userIdRef.current;
+        const { error: delError } = await supabase.from(TABLE).delete().eq('user_id', uid);
+        if (delError) throw delError;
+        const rows = ['people', 'interactions'].flatMap((coll) =>
+          Object.entries(target[coll]).map(([id, data]) => ({ user_id: uid, collection: coll, id, data }))
+        );
+        for (let i = 0; i < rows.length; i += 200) {
+          const { error } = await supabase.from(TABLE).insert(rows.slice(i, i + 200));
+          if (error) throw error;
+          onProgress(Math.min(1, (i + 200) / rows.length));
+        }
+        setCols(target);
+        onProgress(1);
+        return;
+      }
+
+      if (!dbRef.current) {
+        setCols(target);
+        onProgress(1);
+        return;
+      }
+
       const current = colsRef.current;
       const ops = [];
       for (const coll of ['people', 'interactions']) {
@@ -222,11 +328,6 @@ export function DataProvider({ children }) {
         }
       }
       for (const id of Object.keys(current.snoozes)) ops.push(() => deleteDoc('snoozes', id));
-      if (!dbRef.current) {
-        setCols(target);
-        onProgress(1);
-        return;
-      }
       let done = 0;
       for (const op of ops) {
         await op();
@@ -236,6 +337,17 @@ export function DataProvider({ children }) {
     },
     async resetToSeed() {
       setCols(await loadSeed());
+    },
+    /** Email a one-time sign-in link (Supabase only). */
+    async signIn(email) {
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: window.location.origin + window.location.pathname },
+      });
+      if (error) throw error;
+    },
+    async signOut() {
+      await supabase?.auth.signOut();
     },
     clearWriteError() {
       setWriteError(null);
@@ -257,7 +369,7 @@ export function DataProvider({ children }) {
     });
   }, [profiles, cols.snoozes]);
 
-  const value = { people, interactions, profiles, suggestions, backend, status, writeError, ...actions };
+  const value = { people, interactions, profiles, suggestions, backend, status, writeError, userEmail, ...actions };
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }
 

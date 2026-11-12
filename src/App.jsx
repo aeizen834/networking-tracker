@@ -8,6 +8,7 @@ import Log from './pages/Log.jsx';
 import AddInteraction from './pages/AddInteraction.jsx';
 import Network from './pages/Network.jsx';
 import DataPage from './pages/DataPage.jsx';
+import SignIn from './pages/SignIn.jsx';
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: '◧', end: true },
@@ -19,8 +20,10 @@ const NAV = [
 ];
 
 export default function App() {
-  const { suggestions, status, people, writeError, clearWriteError } = useData();
+  const { suggestions, status, people, writeError, clearWriteError, userEmail, signOut } = useData();
   const actionable = suggestions.filter((s) => !s.snoozedUntil && s.priority >= 60).length;
+
+  if (status === 'signedOut') return <SignIn />;
 
   return (
     <div className="shell">
@@ -39,6 +42,12 @@ export default function App() {
           ))}
         </nav>
         <Link to="/add" className="btn btn-primary add-btn">+ Log interaction</Link>
+        {userEmail && (
+          <div className="account small muted">
+            <span className="account-email" title={userEmail}>{userEmail}</span>
+            <button className="link-sm" onClick={signOut}>Sign out</button>
+          </div>
+        )}
       </aside>
 
       <main className="content">

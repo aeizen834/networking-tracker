@@ -31,7 +31,7 @@ const usDate = (iso) => {
 };
 
 export default function DataPage() {
-  const { people, interactions, replaceAll, resetToSeed, backend } = useData();
+  const { people, interactions, replaceAll, resetToSeed, backend, userEmail, signOut } = useData();
   const [msg, setMsg] = useState(null);
   const [pending, setPending] = useState(null); // { data, source } awaiting confirmation
   const [progress, setProgress] = useState(null);
@@ -107,8 +107,8 @@ export default function DataPage() {
     <>
       <PageHeader
         title="Import / Export"
-        subtitle={backend === 'db'
-          ? 'Your data is saved with this page and syncs across your devices.'
+        subtitle={backend === 'db' || backend === 'supabase'
+          ? 'Your data is saved online and syncs across your devices.'
           : 'Your data is saved in this browser. Export a backup regularly.'}
       />
       {msg && <div className={`toast ${msg.ok ? '' : 'toast-error'}`}>{msg.ok ? '✓ ' : ''}{msg.text}</div>}
@@ -154,7 +154,14 @@ export default function DataPage() {
         </Card>
       </div>
 
-      {import.meta.env.DEV && (
+      {userEmail && (
+        <Card title="Account">
+          <p className="muted small">Signed in as <strong>{userEmail}</strong>. Only this account can see your data.</p>
+          <button className="btn btn-ghost btn-sm" onClick={signOut}>Sign out</button>
+        </Card>
+      )}
+
+      {import.meta.env.DEV && backend === 'local' && (
         <Card title="Reset">
           <p className="muted small">Go back to the data originally imported from your Google Sheet. Anything added in the app is lost.</p>
           <ConfirmButton
